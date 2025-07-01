@@ -1,11 +1,8 @@
-{
-  Copyright 2025 - Marcus Fernstrom
-  MIT License - See license file for details
-  Version 1.0
-}
-unit bencode;
+{$ifdef FPC}
+{$mode objfpc}{$H+}{$J-}
+{$endif}
 
-{$mode objfpc}{$H+}
+unit bencode;
 
 interface
 
@@ -139,14 +136,14 @@ type
   private
     class function ParseInteger(const Data: string; var Position: Integer): Int64;
     class function ParseString(const Data: string; var Position: Integer): string;
-    class function ParseNode(const Data: string; var Position: Integer; Depth: Integer = 0): TBencodeNode;
+    class function ParseNode(const Data: string; var Position: Integer; Depth: Integer = 0; StrictKeyOrder: Boolean = True): TBencodeNode;
     class procedure EncodeNode(Node: TBencodeNode; Stream: TStream);
 
   public
     // Decoding
-    class function Decode(const Data: string): TBencodeNode; overload;
-    class function Decode(Stream: TStream): TBencodeNode; overload;
-    class function DecodeFromFile(const FileName: string): TBencodeNode;
+    class function Decode(const Data: string; StrictKeyOrder: Boolean = True): TBencodeNode; overload;
+    class function Decode(Stream: TStream; StrictKeyOrder: Boolean = True): TBencodeNode; overload;
+    class function DecodeFromFile(const FileName: string; StrictKeyOrder: Boolean = True): TBencodeNode;
 
     // Encoding
     class function Encode(Node: TBencodeNode): string; overload;
@@ -166,6 +163,12 @@ function BencodeDictionary: TBencodeNode;
 // Helper function for stream reading
 function BytesToString(const Buffer; Size: Integer): string;
 
+// Backward compatibility wrappers (use non-strict parsing by default for real-world files)
+function DecodeBencode(const Data: string): TBencodeNode;
+function DecodeBencodeFromFile(const FileName: string): TBencodeNode;
+function DecodeBencodeStrict(const Data: string): TBencodeNode;
+function DecodeBencodeFromFileStrict(const FileName: string): TBencodeNode;
+
 implementation
 
 const
@@ -184,6 +187,35 @@ begin
     Result[I] := Chr(P^);
     Inc(P);
   end;
+end;
+
+// Binary string comparison for bencode key sorting
+function CompareBinary(const S1, S2: string): Integer;
+var
+  I, MinLen: Integer;
+begin
+  // Get minimum length
+  if Length(S1) < Length(S2) then
+    MinLen := Length(S1)
+  else
+    MinLen := Length(S2);
+
+  // Compare byte by byte
+  for I := 1 to MinLen do
+  begin
+    if Ord(S1[I]) < Ord(S2[I]) then
+      Exit(-1)
+    else if Ord(S1[I]) > Ord(S2[I]) then
+      Exit(1);
+  end;
+
+  // If all compared bytes are equal, shorter string comes first
+  if Length(S1) < Length(S2) then
+    Result := -1
+  else if Length(S1) > Length(S2) then
+    Result := 1
+  else
+    Result := 0;
 end;
 
 { TBencodeNode }
@@ -345,10 +377,10 @@ begin
 
   if not Found then
   begin
-    // Find correct insertion position to maintain sorted order
+    // Find correct insertion position to maintain sorted order (binary comparison)
     InsertPos := 0;
     for I := 0 to Length(FDictValue) - 1 do
-      if CompareStr(Key, FDictValue[I].Key) > 0 then
+      if CompareBinary(Key, FDictValue[I].Key) > 0 then
         InsertPos := I + 1
       else
         Break;
@@ -689,7 +721,7 @@ begin
   Inc(Position, Len);
 end;
 
-class function TBencodeCodec.ParseNode(const Data: string; var Position: Integer; Depth: Integer): TBencodeNode;
+class function TBencodeCodec.ParseNode(const Data: string; var Position: Integer; Depth: Integer; StrictKeyOrder: Boolean): TBencodeNode;
 var
   Key: string;
   Value: TBencodeNode;
@@ -721,7 +753,7 @@ begin
 
           while (Position <= Length(Data)) and (Data[Position] <> 'e') do
           begin
-            Value := ParseNode(Data, Position, Depth + 1);
+            Value := ParseNode(Data, Position, Depth + 1, StrictKeyOrder);
             Result.FListValue.Add(Value);
           end;
 
@@ -748,13 +780,20 @@ begin
               raise EBencodeParseError.Create('Dictionary key must be a string');
             Key := ParseString(Data, Position);
 
-            // Check key ordering
-            if (LastKey <> '') and (CompareStr(Key, LastKey) <= 0) then
-              raise EBencodeParseError.Create('Dictionary keys must be sorted');
+            // Check key ordering if strict mode is enabled
+            if StrictKeyOrder and (LastKey <> '') and (CompareBinary(Key, LastKey) <= 0) then
+            begin
+              // Add debugging information
+              WriteLn('DEBUG: Key ordering violation detected:');
+              WriteLn('  Previous key: "', LastKey, '" (length: ', Length(LastKey), ')');
+              WriteLn('  Current key:  "', Key, '" (length: ', Length(Key), ')');
+              WriteLn('  Binary comparison result: ', CompareBinary(Key, LastKey));
+              raise EBencodeParseError.CreateFmt('Dictionary keys must be sorted. Previous: "%s", Current: "%s"', [LastKey, Key]);
+            end;
             LastKey := Key;
 
             // Parse value
-            Value := ParseNode(Data, Position, Depth + 1);
+            Value := ParseNode(Data, Position, Depth + 1, StrictKeyOrder);
 
             // Add to dictionary using SetDictItem which maintains order
             Result.Values[Key] := Value;
@@ -785,7 +824,7 @@ begin
   end;
 end;
 
-class function TBencodeCodec.Decode(const Data: string): TBencodeNode;
+class function TBencodeCodec.Decode(const Data: string; StrictKeyOrder: Boolean): TBencodeNode;
 var
   Position: Integer;
 begin
@@ -793,13 +832,13 @@ begin
     raise EBencodeParseError.Create('Empty bencode data');
 
   Position := 1;
-  Result := ParseNode(Data, Position);
+  Result := ParseNode(Data, Position, 0, StrictKeyOrder);
 
   if Position <= Length(Data) then
     raise EBencodeParseError.Create('Extra data after bencode structure');
 end;
 
-class function TBencodeCodec.Decode(Stream: TStream): TBencodeNode;
+class function TBencodeCodec.Decode(Stream: TStream; StrictKeyOrder: Boolean): TBencodeNode;
 var
   Data: string;
   Buffer: array[0..8191] of Byte;
@@ -812,16 +851,16 @@ begin
       Data := Data + BytesToString(Buffer, BytesRead);
   until BytesRead = 0;
 
-  Result := Decode(Data);
+  Result := Decode(Data, StrictKeyOrder);
 end;
 
-class function TBencodeCodec.DecodeFromFile(const FileName: string): TBencodeNode;
+class function TBencodeCodec.DecodeFromFile(const FileName: string; StrictKeyOrder: Boolean): TBencodeNode;
 var
   FileStream: TFileStream;
 begin
   FileStream := TFileStream.Create(FileName, fmOpenRead);
   try
-    Result := Decode(FileStream);
+    Result := Decode(FileStream, StrictKeyOrder);
   finally
     FreeAndNil(FileStream);
   end;
@@ -941,6 +980,27 @@ end;
 function BencodeDictionary: TBencodeNode;
 begin
   Result := TBencodeNode.Create(btDictionary);
+end;
+
+// Backward compatibility wrappers
+function DecodeBencode(const Data: string): TBencodeNode;
+begin
+  Result := TBencodeCodec.Decode(Data, False); // Non-strict by default for real-world files
+end;
+
+function DecodeBencodeFromFile(const FileName: string): TBencodeNode;
+begin
+  Result := TBencodeCodec.DecodeFromFile(FileName, False); // Non-strict by default
+end;
+
+function DecodeBencodeStrict(const Data: string): TBencodeNode;
+begin
+  Result := TBencodeCodec.Decode(Data, True); // Strict validation
+end;
+
+function DecodeBencodeFromFileStrict(const FileName: string): TBencodeNode;
+begin
+  Result := TBencodeCodec.DecodeFromFile(FileName, True); // Strict validation
 end;
 
 end.
