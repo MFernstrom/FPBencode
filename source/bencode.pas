@@ -7,7 +7,7 @@ unit bencode;
 interface
 
 uses
-  SysUtils, Classes, Generics.Collections;
+  SysUtils, Classes, Generics.Collections, Dialogs;
 
 type
   // Bencode data types
@@ -437,6 +437,9 @@ var
   I: Integer;
   Spaces: string;
 begin
+  if Not IsConsole then
+    exit;
+
   Spaces := StringOfChar(' ', Indent);
 
   case FNodeType of
@@ -783,11 +786,6 @@ begin
             // Check key ordering if strict mode is enabled
             if StrictKeyOrder and (LastKey <> '') and (CompareBinary(Key, LastKey) <= 0) then
             begin
-              // Add debugging information
-              WriteLn('DEBUG: Key ordering violation detected:');
-              WriteLn('  Previous key: "', LastKey, '" (length: ', Length(LastKey), ')');
-              WriteLn('  Current key:  "', Key, '" (length: ', Length(Key), ')');
-              WriteLn('  Binary comparison result: ', CompareBinary(Key, LastKey));
               raise EBencodeParseError.CreateFmt('Dictionary keys must be sorted. Previous: "%s", Current: "%s"', [LastKey, Key]);
             end;
             LastKey := Key;
